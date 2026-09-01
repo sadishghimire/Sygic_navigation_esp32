@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -10,15 +11,18 @@
 #include <BLE2902.h>
 
 // ============================================================
-// OLED
+// HARDWARE CONFIGURATION
 // ============================================================
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
 
-#define OLED_SDA 21
-#define OLED_SCL 22
-#define OLED_ADDRESS 0x3C
+#define OLED_SDA       21
+#define OLED_SCL       22
+#define OLED_ADDRESS   0x3C
+
+// Tactile Switch / Push Button Pin (Connected to GND with internal pullup)
+#define BUTTON_PIN     18
 
 Adafruit_SSD1306 display(
   SCREEN_WIDTH,
@@ -28,22 +32,88 @@ Adafruit_SSD1306 display(
 );
 
 // ============================================================
-// Sygic BLE HUD UUIDs
+// SYSTEM MODES
 // ============================================================
 
-#define SERVICE_UUID \
-  "DD3F0AD1-6239-4E1F-81F1-91F6C9F01D86"
+enum AppMode {
+  MODE_NAVIGATION = 0,
+  MODE_STOPWATCH,
+  MODE_WIFI_SCANNER,
+  MODE_SYSTEM_MONITOR,
+  MODE_TORCH,
+  MODE_COUNT
+};
 
-#define CHAR_INDICATE_UUID \
-  "DD3F0AD2-6239-4E1F-81F1-91F6C9F01D86"
+AppMode currentMode = MODE_NAVIGATION;
 
-#define CHAR_WRITE_UUID \
-  "DD3F0AD3-6239-4E1F-81F1-91F6C9F01D86"
+// Mode change transition banner
+unsigned long modeBannerUntil = 0;
+const char* modeNames[] = {
+  "1. Sygic Nav HUD",
+  "2. Clock & Timer",
+  "3. WiFi Scanner",
+  "4. System Monitor",
+  "5. Screen Torch"
+};
 
 // ============================================================
+// BUTTON DEBOUNCE & PRESS DETECTION
+// ============================================================
+
+enum ButtonEvent {
+  BTN_NONE = 0,
+  BTN_SHORT_PRESS,
+  BTN_LONG_PRESS
+};
+
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONG_PRESS_MS = 700;
+
+int lastButtonState = HIGH;
+int buttonState = HIGH;
+unsigned long buttonPressTime = 0;
+bool isLongPressHandled = false;
+
+ButtonEvent readButtonEvent() {
+  int reading = digitalRead(BUTTON_PIN);
+  ButtonEvent event = BTN_NONE;
+
+  if (reading != lastButtonState) {
+    // State change detected
+  }
+
+  // Button pressed (active LOW with pull-up)
+  if (reading == LOW && lastButtonState == HIGH) {
+    buttonPressTime = millis();
+    isLongPressHandled = false;
+  }
+  // Button held down
+  else if (reading == LOW && lastButtonState == LOW) {
+    if (!isLongPressHandled && (millis() - buttonPressTime >= LONG_PRESS_MS)) {
+      isLongPressHandled = true;
+      event = BTN_LONG_PRESS;
+    }
+  }
+  // Button released
+  else if (reading == HIGH && lastButtonState == LOW) {
+    if (!isLongPressHandled && (millis() - buttonPressTime >= DEBOUNCE_MS)) {
+      event = BTN_SHORT_PRESS;
+    }
+  }
+
+  lastButtonState = reading;
+  return event;
+}
+
+// ============================================================
+// SYGIC BLE HUD UUIDs & CONSTANTS
+// ============================================================
+
+#define SERVICE_UUID        "DD3F0AD1-6239-4E1F-81F1-91F6C9F01D86"
+#define CHAR_INDICATE_UUID  "DD3F0AD2-6239-4E1F-81F1-91F6C9F01D86"
+#define CHAR_WRITE_UUID     "DD3F0AD3-6239-4E1F-81F1-91F6C9F01D86"
+
 // Sygic directions
-// ============================================================
-
 #define DIRECTION_NONE          0
 #define DIRECTION_START         1
 #define DIRECTION_EASY_LEFT     2
@@ -68,224 +138,115 @@ Adafruit_SSD1306 display(
 #define DIRECTION_EXIT_LEFT     21
 #define DIRECTION_EXIT_RIGHT    22
 
-// ============================================================
 // BLE variables
-// ============================================================
-
 BLEServer* bleServer = nullptr;
 BLECharacteristic* indicateCharacteristic = nullptr;
-
 bool deviceConnected = false;
-
 unsigned long lastActivity = 0;
 
-// ============================================================
-// Navigation data
-// ============================================================
-
+// Navigation live data
 uint8_t currentSpeed = 0;
 uint8_t currentDirection = DIRECTION_NONE;
-
 String currentMessage = "";
+bool hasNavData = false;
 
 // ============================================================
-// Display helpers
+// STOPWATCH & CLOCK STATE
 // ============================================================
 
-void clearDisplay()
-{
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
+bool stopwatchRunning = false;
+unsigned long stopwatchStartTime = 0;
+unsigned long stopwatchAccumulated = 0;
+
+void toggleStopwatch() {
+  if (stopwatchRunning) {
+    stopwatchAccumulated += (millis() - stopwatchStartTime);
+    stopwatchRunning = false;
+  } else {
+    stopwatchStartTime = millis();
+    stopwatchRunning = true;
+  }
+}
+
+void resetStopwatch() {
+  stopwatchRunning = false;
+  stopwatchAccumulated = 0;
+  stopwatchStartTime = 0;
+}
+
+unsigned long getStopwatchElapsed() {
+  if (stopwatchRunning) {
+    return stopwatchAccumulated + (millis() - stopwatchStartTime);
+  }
+  return stopwatchAccumulated;
 }
 
 // ============================================================
-// Draw LEFT arrow
+// WIFI SCANNER STATE
 // ============================================================
 
-void drawLeftArrow()
-{
-  display.drawLine(
-    100, 32,
-    35, 32,
-    SSD1306_WHITE
-  );
+int wifiNetworksFound = -1;
+bool isScanningWifi = false;
+unsigned long lastWifiScanTime = 0;
+int wifiScrollIndex = 0;
 
-  display.drawLine(
-    35, 32,
-    55, 12,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    35, 32,
-    55, 52,
-    SSD1306_WHITE
-  );
+void triggerWifiScan() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(10);
+  wifiNetworksFound = WiFi.scanNetworks(true); // Async scan
+  isScanningWifi = true;
+  lastWifiScanTime = millis();
+  wifiScrollIndex = 0;
 }
 
 // ============================================================
-// Draw RIGHT arrow
+// NAVIGATION DISPLAY DRAWING HELPERS
 // ============================================================
 
-void drawRightArrow()
-{
-  display.drawLine(
-    28, 32,
-    93, 32,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    93, 32,
-    73, 12,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    93, 32,
-    73, 52,
-    SSD1306_WHITE
-  );
+void drawLeftArrow() {
+  display.drawLine(100, 32, 35, 32, SSD1306_WHITE);
+  display.drawLine(35, 32, 55, 12, SSD1306_WHITE);
+  display.drawLine(35, 32, 55, 52, SSD1306_WHITE);
 }
 
-// ============================================================
-// Draw STRAIGHT arrow
-// ============================================================
-
-void drawStraightArrow()
-{
-  display.drawLine(
-    64, 52,
-    64, 12,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    64, 12,
-    45, 31,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    64, 12,
-    83, 31,
-    SSD1306_WHITE
-  );
+void drawRightArrow() {
+  display.drawLine(28, 32, 93, 32, SSD1306_WHITE);
+  display.drawLine(93, 32, 73, 12, SSD1306_WHITE);
+  display.drawLine(93, 32, 73, 52, SSD1306_WHITE);
 }
 
-// ============================================================
-// Draw U-TURN
-// ============================================================
-
-void drawUTurn()
-{
-  // U shape
-
-  display.drawLine(
-    42, 15,
-    42, 35,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    42, 35,
-    48, 45,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    48, 45,
-    64, 50,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    64, 50,
-    80, 45,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    80, 45,
-    86, 35,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    86, 35,
-    86, 15,
-    SSD1306_WHITE
-  );
-
-  // Arrow head
-
-  display.drawLine(
-    42, 15,
-    34, 23,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    42, 15,
-    50, 23,
-    SSD1306_WHITE
-  );
+void drawStraightArrow() {
+  display.drawLine(64, 52, 64, 12, SSD1306_WHITE);
+  display.drawLine(64, 12, 45, 31, SSD1306_WHITE);
+  display.drawLine(64, 12, 83, 31, SSD1306_WHITE);
 }
 
-// ============================================================
-// Draw small diagonal arrow
-// ============================================================
-
-void drawEasyLeft()
-{
-  display.drawLine(
-    100, 45,
-    55, 20,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    55, 20,
-    60, 35,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    55, 20,
-    72, 20,
-    SSD1306_WHITE
-  );
+void drawUTurn() {
+  display.drawLine(42, 15, 42, 35, SSD1306_WHITE);
+  display.drawLine(42, 35, 48, 45, SSD1306_WHITE);
+  display.drawLine(48, 45, 64, 50, SSD1306_WHITE);
+  display.drawLine(64, 50, 80, 45, SSD1306_WHITE);
+  display.drawLine(80, 45, 86, 35, SSD1306_WHITE);
+  display.drawLine(86, 35, 86, 15, SSD1306_WHITE);
+  display.drawLine(42, 15, 34, 23, SSD1306_WHITE);
+  display.drawLine(42, 15, 50, 23, SSD1306_WHITE);
 }
 
-void drawEasyRight()
-{
-  display.drawLine(
-    28, 45,
-    73, 20,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    73, 20,
-    56, 20,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    73, 20,
-    68, 35,
-    SSD1306_WHITE
-  );
+void drawEasyLeft() {
+  display.drawLine(100, 45, 55, 20, SSD1306_WHITE);
+  display.drawLine(55, 20, 60, 35, SSD1306_WHITE);
+  display.drawLine(55, 20, 72, 20, SSD1306_WHITE);
 }
 
-// ============================================================
-// Draw direction
-// ============================================================
+void drawEasyRight() {
+  display.drawLine(28, 45, 73, 20, SSD1306_WHITE);
+  display.drawLine(73, 20, 56, 20, SSD1306_WHITE);
+  display.drawLine(73, 20, 68, 35, SSD1306_WHITE);
+}
 
-void drawDirection(uint8_t direction)
-{
-  switch (direction)
-  {
+void drawDirection(uint8_t direction) {
+  switch (direction) {
     case DIRECTION_LEFT:
     case DIRECTION_SHARP_LEFT:
     case DIRECTION_KEEP_LEFT:
@@ -324,596 +285,488 @@ void drawDirection(uint8_t direction)
   }
 }
 
-// ============================================================
-// Draw distance / navigation message
-// ============================================================
+void drawSpeed(uint8_t speed) {
+  if (speed == 0) return;
 
-void drawMessage(String message)
-{
-  if (message.length() == 0)
-    return;
+  display.setTextSize(1);
+  String speedText = String(speed) + " km/h";
 
-  // Remove any strange characters
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(speedText, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(128 - w - 2, 1);
+  display.print(speedText);
+}
+
+void drawMessage(String message) {
+  if (message.length() == 0) return;
+
   message.replace("\r", "");
   message.replace("\n", " ");
 
   display.setTextColor(SSD1306_WHITE);
-
-  // Try to display message on bottom 20 pixels
-
   display.setTextSize(1);
-
   int maxChars = 21;
 
-  if (message.length() <= maxChars)
-  {
+  if (message.length() <= maxChars) {
     display.setCursor(0, 54);
     display.print(message);
     return;
   }
 
-  // Split into two lines
-
-  String line1 = message.substring(
-    0,
-    maxChars
-  );
-
-  String line2 = message.substring(
-    maxChars,
-    min((int)message.length(), maxChars * 2)
-  );
+  String line1 = message.substring(0, maxChars);
+  String line2 = message.substring(maxChars, min((int)message.length(), maxChars * 2));
 
   display.setCursor(0, 45);
   display.print(line1);
-
   display.setCursor(0, 55);
   display.print(line2);
 }
 
 // ============================================================
-// Draw speed
+// TOP STATUS BAR HELPER
 // ============================================================
 
-void drawSpeed(uint8_t speed)
-{
-  if (speed == 0)
-    return;
-
+void drawTopStatusBar(const char* title) {
+  display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
   display.setTextSize(1);
+  display.setCursor(2, 1);
+  display.print(title);
 
-  String speedText =
-    String(speed) + " km/h";
-
-  int16_t x1;
-  int16_t y1;
-  uint16_t w;
-  uint16_t h;
-
-  display.getTextBounds(
-    speedText,
-    0,
-    0,
-    &x1,
-    &y1,
-    &w,
-    &h
-  );
-
-  display.setCursor(
-    128 - w - 2,
-    1
-  );
-
-  display.print(speedText);
-}
-
-// ============================================================
-// Main navigation screen
-// ============================================================
-
-void showNavigation()
-{
-  clearDisplay();
-
-  // Direction
-  drawDirection(currentDirection);
-
-  // Speed
-  drawSpeed(currentSpeed);
-
-  // Message / distance
-  drawMessage(currentMessage);
-
-  display.display();
-}
-
-// ============================================================
-// Waiting screen
-// ============================================================
-
-void showWaiting()
-{
-  clearDisplay();
-
-  display.setTextSize(2);
-
-  display.setCursor(25, 5);
-  display.println("NAV");
-
-  display.setTextSize(1);
-
-  display.setCursor(15, 30);
-
-  if (deviceConnected)
-  {
-    display.println("Sygic connected");
+  // BLE status indicator dot
+  if (deviceConnected) {
+    display.setCursor(102, 1);
+    display.print("[BLE]");
   }
-  else
-  {
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+}
+
+// ============================================================
+// RENDER FUNCTIONS FOR EACH MODE
+// ============================================================
+
+// Mode 1: Sygic Navigation
+void renderNavigationMode() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  if (!deviceConnected) {
+    display.setTextSize(2);
+    display.setCursor(25, 6);
+    display.println("NAV");
+
+    display.setTextSize(1);
+    display.setCursor(10, 30);
     display.println("Waiting for Sygic");
+
+    display.setCursor(10, 44);
+    display.println("BLE HUD: Advertising");
+
+    display.setCursor(10, 55);
+    display.println("Press BTN: Next Mode");
+  } else if (!hasNavData || (currentDirection == DIRECTION_NONE && currentMessage.length() == 0)) {
+    display.setTextSize(2);
+    display.setCursor(25, 6);
+    display.println("NAV");
+
+    display.setTextSize(1);
+    display.setCursor(10, 30);
+    display.println("Sygic Connected!");
+
+    display.setCursor(10, 44);
+    display.println("Start Route in App");
+  } else {
+    // Active navigation display
+    drawDirection(currentDirection);
+    drawSpeed(currentSpeed);
+    drawMessage(currentMessage);
   }
-
-  display.setCursor(12, 45);
-  display.println("BLE HUD enabled");
-
-  display.display();
 }
 
-// ============================================================
-// No route screen
-// ============================================================
+// Mode 2: Clock & Stopwatch
+void renderStopwatchMode() {
+  display.clearDisplay();
+  drawTopStatusBar("STOPWATCH & CLOCK");
 
-void showNoRoute()
-{
-  clearDisplay();
+  // System Uptime Clock
+  unsigned long totalSec = millis() / 1000;
+  int upH = totalSec / 3600;
+  int upM = (totalSec % 3600) / 60;
+  int upS = totalSec % 60;
+
+  display.setTextSize(1);
+  display.setCursor(2, 14);
+  display.printf("Up: %02d:%02d:%02d", upH, upM, upS);
+
+  // Stopwatch Timer Display
+  unsigned long elapsed = getStopwatchElapsed();
+  unsigned long swMs = (elapsed % 1000) / 100; // tenths
+  unsigned long swSec = (elapsed / 1000) % 60;
+  unsigned long swMin = (elapsed / 60000) % 60;
+  unsigned long swHr = elapsed / 3600000;
 
   display.setTextSize(2);
+  display.setCursor(8, 28);
+  if (swHr > 0) {
+    display.printf("%02lu:%02lu:%02lu", swHr, swMin, swSec);
+  } else {
+    display.printf("%02lu:%02lu.%01lu", swMin, swSec, swMs);
+  }
 
-  display.setCursor(10, 5);
-  display.println("NO");
+  // Controls legend
+  display.setTextSize(1);
+  display.setCursor(2, 48);
+  if (stopwatchRunning) {
+    display.print("Status: [RUNNING]");
+  } else if (elapsed > 0) {
+    display.print("Status: [PAUSED]");
+  } else {
+    display.print("Status: [READY]");
+  }
 
-  display.setCursor(10, 30);
-  display.println("ROUTE");
+  display.setCursor(2, 56);
+  display.print("Hold: Start/Stop/Reset");
+}
 
-  display.display();
+// Mode 3: WiFi Scanner
+void renderWifiScannerMode() {
+  display.clearDisplay();
+  drawTopStatusBar("WIFI SCANNER");
+
+  // Check async scan status
+  int16_t scanStatus = WiFi.scanComplete();
+  if (scanStatus == WIFI_SCAN_RUNNING) {
+    display.setTextSize(1);
+    display.setCursor(15, 26);
+    display.println("Scanning 2.4GHz...");
+    display.setCursor(15, 40);
+    display.println("Please wait...");
+    return;
+  } else if (scanStatus >= 0) {
+    wifiNetworksFound = scanStatus;
+    isScanningWifi = false;
+  }
+
+  if (wifiNetworksFound <= 0) {
+    display.setTextSize(1);
+    display.setCursor(10, 24);
+    display.println("No networks found.");
+    display.setCursor(10, 44);
+    display.println("Hold BTN to Rescan");
+  } else {
+    display.setTextSize(1);
+    display.setCursor(2, 13);
+    display.printf("Found: %d nets (Hold:Scan)", wifiNetworksFound);
+
+    // Show up to 4 networks
+    int displayLimit = min(wifiNetworksFound, 4);
+    for (int i = 0; i < displayLimit; i++) {
+      int yPos = 24 + (i * 10);
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() > 13) {
+        ssid = ssid.substring(0, 11) + "..";
+      }
+      int32_t rssi = WiFi.RSSI(i);
+
+      display.setCursor(2, yPos);
+      display.printf("%d.%s", i + 1, ssid.c_str());
+
+      display.setCursor(92, yPos);
+      display.printf("%ddBm", rssi);
+    }
+  }
+}
+
+// Mode 4: System Monitor
+void renderSystemMonitorMode() {
+  display.clearDisplay();
+  drawTopStatusBar("SYSTEM MONITOR");
+
+  display.setTextSize(1);
+
+  // CPU Frequency
+  display.setCursor(2, 14);
+  display.printf("CPU Freq: %d MHz", getCpuFrequencyMhz());
+
+  // Free RAM Heap
+  display.setCursor(2, 25);
+  display.printf("Free Heap: %u KB", ESP.getFreeHeap() / 1024);
+
+  // Min Free Heap
+  display.setCursor(2, 36);
+  display.printf("Min Heap:  %u KB", ESP.getMinFreeHeap() / 1024);
+
+  // Flash Chip Size
+  display.setCursor(2, 47);
+  display.printf("Flash: %u MB", ESP.getFlashChipSize() / (1024 * 1024));
+
+  // BLE Connection State
+  display.setCursor(2, 56);
+  display.printf("BLE: %s", deviceConnected ? "Connected (Sygic)" : "Advertising");
+}
+
+// Mode 5: Torch / Screen Light
+void renderTorchMode() {
+  // Fill entire display white with maximum brightness
+  display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+}
+
+// Mode Switch Announcement Banner
+void renderModeBanner() {
+  display.clearDisplay();
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.drawRect(2, 2, 124, 60, SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(24, 14);
+  display.print("SWITCHING TO:");
+
+  display.setTextSize(1);
+  display.setCursor(14, 34);
+  display.print(modeNames[currentMode]);
+
+  display.setCursor(20, 48);
+  display.print("Release to view");
 }
 
 // ============================================================
-// BLE server callbacks
+// BLE SERVER CALLBACKS
 // ============================================================
 
-class MyServerCallbacks : public BLEServerCallbacks
-{
-  void onConnect(
-    BLEServer* server
-  ) override
-  {
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* server) override {
     deviceConnected = true;
-
     lastActivity = millis();
-
-    Serial.println();
-    Serial.println("==========================");
-    Serial.println("Sygic CONNECTED");
-    Serial.println("==========================");
-
-    showWaiting();
+    Serial.println("\n[BLE] Sygic CONNECTED");
   }
 
-  void onDisconnect(
-    BLEServer* server
-  ) override
-  {
+  void onDisconnect(BLEServer* server) override {
     deviceConnected = false;
-
-    Serial.println();
-    Serial.println("Sygic DISCONNECTED");
-
-    showWaiting();
-
-    delay(500);
-
+    hasNavData = false;
+    Serial.println("\n[BLE] Sygic DISCONNECTED");
+    delay(200);
     BLEDevice::startAdvertising();
   }
 };
 
 // ============================================================
-// BLE data callback
+// BLE DATA CALLBACK
 // ============================================================
 
-class MyWriteCallbacks :
-  public BLECharacteristicCallbacks
-{
-  void onWrite(
-    BLECharacteristic* characteristic
-  ) override
-  {
-    std::string value =
-      characteristic->getValue();
-
+class MyWriteCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* characteristic) override {
+    std::string value = characteristic->getValue();
     lastActivity = millis();
 
-    if (value.length() == 0)
-      return;
+    if (value.length() == 0) return;
 
-    // --------------------------------------------------------
-    // Print RAW packet
-    // --------------------------------------------------------
-
-    Serial.println();
-    Serial.println("--------------------------");
-
-    Serial.print(
-      "Received bytes: "
-    );
-
-    Serial.println(
-      value.length()
-    );
-
-    Serial.print(
-      "HEX: "
-    );
-
-    for (size_t i = 0;
-         i < value.length();
-         i++)
-    {
-      Serial.printf(
-        "%02X ",
-        (uint8_t)value[i]
-      );
-    }
-
-    Serial.println();
-
-    // --------------------------------------------------------
-    // Sygic basic data format:
-    //
-    // byte 0 = data type
-    // byte 1 = speed
-    // byte 2 = direction
-    // byte 3+ = text
-    //
-    // Example:
-    //
-    // 01 32 0A 33 35 30 6D
-    //
-    // 01 = basic data
-    // 32 = 50 km/h
-    // 0A = right
-    // "350m"
-    // --------------------------------------------------------
-
-    const uint8_t* data =
-      (const uint8_t*)value.data();
-
+    const uint8_t* data = (const uint8_t*)value.data();
     uint8_t dataType = data[0];
 
-    Serial.print(
-      "Data type: 0x"
-    );
+    // Sygic Basic Navigation Data Packet (0x01)
+    if (dataType == 0x01) {
+      if (value.length() < 3) return;
 
-    Serial.printf(
-      "%02X\n",
-      dataType
-    );
+      currentSpeed = data[1];
+      currentDirection = data[2];
 
-    // --------------------------------------------------------
-    // Basic navigation data
-    // --------------------------------------------------------
-
-    if (dataType == 0x01)
-    {
-      if (value.length() < 3)
-      {
-        Serial.println(
-          "Invalid navigation packet"
-        );
-
-        return;
-      }
-
-      currentSpeed =
-        data[1];
-
-      currentDirection =
-        data[2];
-
-      // Text begins at byte 3
       currentMessage = "";
-
-      for (size_t i = 3;
-           i < value.length();
-           i++)
-      {
-        char c =
-          (char)data[i];
-
-        if (c == '\0')
-          break;
-
+      for (size_t i = 3; i < value.length(); i++) {
+        char c = (char)data[i];
+        if (c == '\0') break;
         currentMessage += c;
       }
 
-      Serial.print(
-        "Speed: "
-      );
+      hasNavData = true;
 
-      Serial.println(
-        currentSpeed
-      );
-
-      Serial.print(
-        "Direction: "
-      );
-
-      Serial.println(
-        currentDirection
-      );
-
-      Serial.print(
-        "Message: "
-      );
-
-      Serial.println(
-        currentMessage
-      );
-
-      showNavigation();
-    }
-
-    // --------------------------------------------------------
-    // Unknown packet
-    // --------------------------------------------------------
-
-    else
-    {
-      Serial.println(
-        "Unknown Sygic packet type"
-      );
+      Serial.printf("[NAV] Speed: %d km/h | Dir: %d | Msg: %s\n",
+                    currentSpeed, currentDirection, currentMessage.c_str());
     }
   }
 };
 
 // ============================================================
-// Setup BLE
+// SETUP FUNCTIONS
 // ============================================================
 
-void setupBLE()
-{
-  Serial.println(
-    "Starting BLE..."
+void setupBLE() {
+  Serial.println("Starting BLE...");
+  BLEDevice::init("ESP32 HUD");
+
+  bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* service = bleServer->createService(SERVICE_UUID);
+
+  indicateCharacteristic = service->createCharacteristic(
+    CHAR_INDICATE_UUID,
+    BLECharacteristic::PROPERTY_INDICATE
   );
+  indicateCharacteristic->addDescriptor(new BLE2902());
+  indicateCharacteristic->setValue("");
 
-  // IMPORTANT:
-  // This name doesn't matter much because Sygic searches
-  // for the service UUID.
-
-  BLEDevice::init(
-    "ESP32 HUD"
+  BLECharacteristic* writeCharacteristic = service->createCharacteristic(
+    CHAR_WRITE_UUID,
+    BLECharacteristic::PROPERTY_WRITE
   );
-
-  bleServer =
-    BLEDevice::createServer();
-
-  bleServer->setCallbacks(
-    new MyServerCallbacks()
-  );
-
-  // ----------------------------------------------------------
-  // Create service
-  // ----------------------------------------------------------
-
-  BLEService* service =
-    bleServer->createService(
-      SERVICE_UUID
-    );
-
-  // ----------------------------------------------------------
-  // Indication characteristic
-  // ----------------------------------------------------------
-
-  indicateCharacteristic =
-    service->createCharacteristic(
-      CHAR_INDICATE_UUID,
-      BLECharacteristic::PROPERTY_INDICATE
-    );
-
-  indicateCharacteristic->addDescriptor(
-    new BLE2902()
-  );
-
-  indicateCharacteristic->setValue(
-    ""
-  );
-
-  // ----------------------------------------------------------
-  // Write characteristic
-  // ----------------------------------------------------------
-
-  BLECharacteristic* writeCharacteristic =
-    service->createCharacteristic(
-      CHAR_WRITE_UUID,
-      BLECharacteristic::PROPERTY_WRITE
-    );
-
-  writeCharacteristic->setCallbacks(
-    new MyWriteCallbacks()
-  );
-
-  // ----------------------------------------------------------
-  // Start service
-  // ----------------------------------------------------------
+  writeCharacteristic->setCallbacks(new MyWriteCallbacks());
 
   service->start();
 
-  // ----------------------------------------------------------
-  // Advertising
-  // ----------------------------------------------------------
-
-  BLEAdvertising* advertising =
-    BLEDevice::getAdvertising();
-
-  advertising->addServiceUUID(
-    SERVICE_UUID
-  );
-
-  advertising->setScanResponse(
-    true
-  );
-
-  // Important for iPhone connections
-
-  advertising->setMinPreferred(
-    0x06
-  );
-
-  advertising->setMinPreferred(
-    0x12
-  );
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMinPreferred(0x12);
 
   BLEDevice::startAdvertising();
-
-  Serial.println(
-    "BLE advertising started"
-  );
+  Serial.println("BLE Advertising started successfully.");
 }
 
-// ============================================================
-// OLED setup
-// ============================================================
+void setupOLED() {
+  Wire.begin(OLED_SDA, OLED_SCL);
 
-void setupOLED()
-{
-  Wire.begin(
-    OLED_SDA,
-    OLED_SCL
-  );
-
-  if (!display.begin(
-        SSD1306_SWITCHCAPVCC,
-        OLED_ADDRESS
-      ))
-  {
-    Serial.println(
-      "SSD1306 initialization FAILED"
-    );
-
-    while (true)
-    {
-      delay(100);
-    }
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("SSD1306 OLED initialization FAILED!");
+    while (true) { delay(100); }
   }
 
   display.clearDisplay();
-
-  display.setTextColor(
-    SSD1306_WHITE
-  );
-
+  display.setTextColor(SSD1306_WHITE);
   display.setTextSize(2);
-
-  display.setCursor(
-    25,
-    5
-  );
-
-  display.println(
-    "NAV"
-  );
-
+  display.setCursor(20, 10);
+  display.println("ESP32");
   display.setTextSize(1);
-
-  display.setCursor(
-    20,
-    35
-  );
-
-  display.println(
-    "Starting BLE..."
-  );
-
+  display.setCursor(12, 34);
+  display.println("Multi-Mode Device");
+  display.setCursor(18, 48);
+  display.println("Initializing...");
   display.display();
-
-  delay(1000);
+  delay(1200);
 }
 
 // ============================================================
-// SETUP
+// MAIN ARDUINO SETUP
 // ============================================================
 
-void setup()
-{
+void setup() {
   Serial.begin(115200);
+  delay(400);
 
-  delay(500);
+  Serial.println("\n=========================================");
+  Serial.println(" ESP32 MULTIPURPOSE NAVIGATION & UTILITIES");
+  Serial.println("=========================================");
 
-  Serial.println();
-  Serial.println();
-  Serial.println(
-    "================================"
-  );
-  Serial.println(
-    " ESP32 SYGIC BLE NAVIGATION HUD"
-  );
-  Serial.println(
-    "================================"
-  );
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   setupOLED();
-
   setupBLE();
 
+  // Trigger initial background WiFi scan for WiFi Scanner mode
+  triggerWifiScan();
+
   lastActivity = millis();
-
-  showWaiting();
-
-  Serial.println(
-    "Setup complete."
-  );
-
-  Serial.println(
-    "Waiting for Sygic..."
-  );
+  Serial.println("System Ready. Use Tactile Button on GPIO 18 to switch modes.");
 }
 
 // ============================================================
-// LOOP
+// MAIN ARDUINO LOOP
 // ============================================================
 
-void loop()
-{
+unsigned long lastDisplayRefresh = 0;
+const unsigned long DISPLAY_REFRESH_INTERVAL = 60; // ~16 FPS
+
+void loop() {
   // ----------------------------------------------------------
-  // If connected but Sygic hasn't sent anything for 4 sec,
-  // send an EMPTY indication.
-  //
-  // This is how the original Sygic BLE-HUD protocol requests
-  // an update.
+  // 1. Handle Button Inputs (Short & Long Press)
   // ----------------------------------------------------------
+  ButtonEvent event = readButtonEvent();
 
-  if (deviceConnected)
-  {
-    if (
-      millis() - lastActivity > 4000
-    )
-    {
-      Serial.println(
-        "Requesting Sygic update..."
-      );
+  if (event == BTN_SHORT_PRESS) {
+    // Cycle to next mode
+    currentMode = (AppMode)((currentMode + 1) % MODE_COUNT);
+    modeBannerUntil = millis() + 900; // Show mode name banner for 900ms
+    Serial.printf("[BUTTON] Short Press -> Switched to: %s\n", modeNames[currentMode]);
 
-      // Empty value
+    // Auto-trigger actions upon entering specific modes
+    if (currentMode == MODE_WIFI_SCANNER && !isScanningWifi) {
+      triggerWifiScan();
+    }
+  } else if (event == BTN_LONG_PRESS) {
+    Serial.printf("[BUTTON] Long Press in mode: %s\n", modeNames[currentMode]);
 
-      indicateCharacteristic->setValue(
-        ""
-      );
+    // Contextual Long-press actions
+    switch (currentMode) {
+      case MODE_STOPWATCH:
+        if (stopwatchRunning) {
+          toggleStopwatch(); // Pause
+        } else if (getStopwatchElapsed() > 0) {
+          resetStopwatch();  // Reset
+        } else {
+          toggleStopwatch(); // Start
+        }
+        break;
 
+      case MODE_WIFI_SCANNER:
+        triggerWifiScan();   // Rescan WiFi
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 2. Sygic BLE Keep-Alive Protocol (Background Task)
+  // ----------------------------------------------------------
+  if (deviceConnected) {
+    if (millis() - lastActivity > 4000) {
+      indicateCharacteristic->setValue("");
       indicateCharacteristic->indicate();
-
       lastActivity = millis();
     }
   }
 
-  delay(10);
+  // ----------------------------------------------------------
+  // 3. Render Display
+  // ----------------------------------------------------------
+  if (millis() - lastDisplayRefresh >= DISPLAY_REFRESH_INTERVAL) {
+    lastDisplayRefresh = millis();
+
+    // Check if mode announcement banner is active
+    if (millis() < modeBannerUntil) {
+      renderModeBanner();
+    } else {
+      switch (currentMode) {
+        case MODE_NAVIGATION:
+          renderNavigationMode();
+          break;
+
+        case MODE_STOPWATCH:
+          renderStopwatchMode();
+          break;
+
+        case MODE_WIFI_SCANNER:
+          renderWifiScannerMode();
+          break;
+
+        case MODE_SYSTEM_MONITOR:
+          renderSystemMonitorMode();
+          break;
+
+        case MODE_TORCH:
+          renderTorchMode();
+          break;
+
+        default:
+          break;
+      }
+    }
+
+    display.display();
+  }
+
+  delay(5);
 }
