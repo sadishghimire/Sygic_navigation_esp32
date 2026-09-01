@@ -4,6 +4,8 @@
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_BMP085.h>
+#include <DHT.h>
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -11,25 +13,33 @@
 #include <BLE2902.h>
 
 // ============================================================
-// HARDWARE CONFIGURATION
+// HARDWARE PIN DEFINITIONS
 // ============================================================
 
 #define SCREEN_WIDTH   128
 #define SCREEN_HEIGHT  64
 
+// I2C Bus Pins (Shared by SSD1306 OLED & BMP180 Barometer)
 #define OLED_SDA       21
 #define OLED_SCL       22
 #define OLED_ADDRESS   0x3C
 
-// Tactile Switch / Push Button Pin (Connected to GND with internal pullup)
+// Tactile Switch / Push Button Pin (Internal Pull-Up)
 #define BUTTON_PIN     18
 
-Adafruit_SSD1306 display(
-  SCREEN_WIDTH,
-  SCREEN_HEIGHT,
-  &Wire,
-  -1
-);
+// DHT11 Sensor Pin (1-Wire Digital Data)
+#define DHT_PIN        4
+#define DHTTYPE        DHT11
+
+// ============================================================
+// HARDWARE OBJECTS
+// ============================================================
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_BMP085 bmp;
+DHT dht(DHT_PIN, DHTTYPE);
+
+bool bmpFound = false;
 
 // ============================================================
 // SYSTEM MODES
@@ -37,6 +47,7 @@ Adafruit_SSD1306 display(
 
 enum AppMode {
   MODE_NAVIGATION = 0,
+  MODE_WEATHER,
   MODE_STOPWATCH,
   MODE_WIFI_SCANNER,
   MODE_SYSTEM_MONITOR,
@@ -50,11 +61,72 @@ AppMode currentMode = MODE_NAVIGATION;
 unsigned long modeBannerUntil = 0;
 const char* modeNames[] = {
   "1. Sygic Nav HUD",
-  "2. Clock & Timer",
-  "3. WiFi Scanner",
-  "4. System Monitor",
-  "5. Screen Torch"
+  "2. Weather Station",
+  "3. Clock & Timer",
+  "4. WiFi Scanner",
+  "5. System Monitor",
+  "6. Screen Torch"
 };
+
+// ============================================================
+// WEATHER DATA & UNITS
+// ============================================================
+
+struct WeatherData {
+  float temperatureC = NAN;
+  float temperatureF = NAN;
+  float humidity = NAN;
+  float pressureHpa = NAN;
+  float altitudeMeters = NAN;
+  float altitudeFeet = NAN;
+  bool dhtValid = false;
+  bool bmpValid = false;
+};
+
+WeatherData currentWeather;
+bool weatherUseImperial = false; // false = Metric (°C, m), true = Imperial (°F, ft)
+unsigned long lastWeatherReadTime = 0;
+const unsigned long WEATHER_READ_INTERVAL = 2000; // Read sensors every 2 seconds
+
+void updateWeatherSensors() {
+  if (millis() - lastWeatherReadTime < WEATHER_READ_INTERVAL && lastWeatherReadTime != 0) {
+    return;
+  }
+  lastWeatherReadTime = millis();
+
+  // 1. Read DHT11
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(h) || isnan(t)) {
+    currentWeather.dhtValid = false;
+  } else {
+    currentWeather.humidity = h;
+    currentWeather.temperatureC = t;
+    currentWeather.temperatureF = (t * 1.8f) + 32.0f;
+    currentWeather.dhtValid = true;
+  }
+
+  // 2. Read BMP180 (Barometer & High-Precision Temp)
+  if (bmpFound) {
+    float bmpTemp = bmp.readTemperature();
+    float bmpPress = bmp.readPressure() / 100.0f; // Pa to hPa
+    float bmpAlt = bmp.readAltitude(101325);       // Standard sea level pressure
+
+    currentWeather.pressureHpa = bmpPress;
+    currentWeather.altitudeMeters = bmpAlt;
+    currentWeather.altitudeFeet = bmpAlt * 3.28084f;
+    currentWeather.bmpValid = true;
+
+    // If DHT11 failed, use BMP180 temperature as fallback
+    if (!currentWeather.dhtValid) {
+      currentWeather.temperatureC = bmpTemp;
+      currentWeather.temperatureF = (bmpTemp * 1.8f) + 32.0f;
+    }
+  } else {
+    currentWeather.bmpValid = false;
+  }
+}
 
 // ============================================================
 // BUTTON DEBOUNCE & PRESS DETECTION
@@ -70,17 +142,12 @@ const unsigned long DEBOUNCE_MS = 50;
 const unsigned long LONG_PRESS_MS = 700;
 
 int lastButtonState = HIGH;
-int buttonState = HIGH;
 unsigned long buttonPressTime = 0;
 bool isLongPressHandled = false;
 
 ButtonEvent readButtonEvent() {
   int reading = digitalRead(BUTTON_PIN);
   ButtonEvent event = BTN_NONE;
-
-  if (reading != lastButtonState) {
-    // State change detected
-  }
 
   // Button pressed (active LOW with pull-up)
   if (reading == LOW && lastButtonState == HIGH) {
@@ -187,8 +254,6 @@ unsigned long getStopwatchElapsed() {
 
 int wifiNetworksFound = -1;
 bool isScanningWifi = false;
-unsigned long lastWifiScanTime = 0;
-int wifiScrollIndex = 0;
 
 void triggerWifiScan() {
   WiFi.mode(WIFI_STA);
@@ -196,12 +261,10 @@ void triggerWifiScan() {
   delay(10);
   wifiNetworksFound = WiFi.scanNetworks(true); // Async scan
   isScanningWifi = true;
-  lastWifiScanTime = millis();
-  wifiScrollIndex = 0;
 }
 
 // ============================================================
-// NAVIGATION DISPLAY DRAWING HELPERS
+// NAVIGATION DRAWING HELPERS
 // ============================================================
 
 void drawLeftArrow() {
@@ -334,9 +397,9 @@ void drawTopStatusBar(const char* title) {
   display.setCursor(2, 1);
   display.print(title);
 
-  // BLE status indicator dot
+  // BLE status indicator badge
   if (deviceConnected) {
-    display.setCursor(102, 1);
+    display.setCursor(100, 1);
     display.print("[BLE]");
   }
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
@@ -346,7 +409,7 @@ void drawTopStatusBar(const char* title) {
 // RENDER FUNCTIONS FOR EACH MODE
 // ============================================================
 
-// Mode 1: Sygic Navigation
+// Mode 1: Sygic Navigation HUD
 void renderNavigationMode() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -377,14 +440,78 @@ void renderNavigationMode() {
     display.setCursor(10, 44);
     display.println("Start Route in App");
   } else {
-    // Active navigation display
     drawDirection(currentDirection);
     drawSpeed(currentSpeed);
     drawMessage(currentMessage);
   }
 }
 
-// Mode 2: Clock & Stopwatch
+// Mode 2: Mini Weather Station (DHT11 + BMP180)
+void renderWeatherMode() {
+  display.clearDisplay();
+  drawTopStatusBar(weatherUseImperial ? "WEATHER [F/ft]" : "WEATHER [C/m]");
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // 1. Temperature & Humidity Row
+  display.setCursor(2, 13);
+  if (currentWeather.dhtValid || currentWeather.bmpValid) {
+    if (weatherUseImperial) {
+      display.printf("Temp: %.1f F", currentWeather.temperatureF);
+    } else {
+      display.printf("Temp: %.1f C", currentWeather.temperatureC);
+    }
+  } else {
+    display.print("Temp: N/A");
+  }
+
+  display.setCursor(76, 13);
+  if (currentWeather.dhtValid) {
+    display.printf("Hum:%.0f%%", currentWeather.humidity);
+  } else {
+    display.print("Hum: N/A");
+  }
+
+  // 2. Barometric Pressure Row
+  display.setCursor(2, 26);
+  if (currentWeather.bmpValid) {
+    display.printf("Pres: %.1f hPa", currentWeather.pressureHpa);
+  } else {
+    display.print("Pres: BMP180 N/A");
+  }
+
+  // 3. Estimated Altitude Row
+  display.setCursor(2, 39);
+  if (currentWeather.bmpValid) {
+    if (weatherUseImperial) {
+      display.printf("Alt:  %.0f ft", currentWeather.altitudeFeet);
+    } else {
+      display.printf("Alt:  %.0f m", currentWeather.altitudeMeters);
+    }
+  } else {
+    display.print("Alt:  BMP180 N/A");
+  }
+
+  // 4. Air Comfort & Forecast Bar
+  display.drawLine(0, 50, 128, 50, SSD1306_WHITE);
+  display.setCursor(2, 54);
+
+  if (currentWeather.dhtValid) {
+    float h = currentWeather.humidity;
+    if (h < 30.0f) {
+      display.print("Air: Dry (Hold: Unit)");
+    } else if (h <= 60.0f) {
+      display.print("Air: Good (Hold: Unit)");
+    } else {
+      display.print("Air: Humid (Hold: Unit)");
+    }
+  } else {
+    display.print("Hold BTN: Change Unit");
+  }
+}
+
+// Mode 3: Clock & Stopwatch
 void renderStopwatchMode() {
   display.clearDisplay();
   drawTopStatusBar("STOPWATCH & CLOCK");
@@ -429,12 +556,11 @@ void renderStopwatchMode() {
   display.print("Hold: Start/Stop/Reset");
 }
 
-// Mode 3: WiFi Scanner
+// Mode 4: WiFi Scanner
 void renderWifiScannerMode() {
   display.clearDisplay();
   drawTopStatusBar("WIFI SCANNER");
 
-  // Check async scan status
   int16_t scanStatus = WiFi.scanComplete();
   if (scanStatus == WIFI_SCAN_RUNNING) {
     display.setTextSize(1);
@@ -478,37 +604,32 @@ void renderWifiScannerMode() {
   }
 }
 
-// Mode 4: System Monitor
+// Mode 5: System Monitor
 void renderSystemMonitorMode() {
   display.clearDisplay();
   drawTopStatusBar("SYSTEM MONITOR");
 
   display.setTextSize(1);
-
-  // CPU Frequency
   display.setCursor(2, 14);
   display.printf("CPU Freq: %d MHz", getCpuFrequencyMhz());
 
-  // Free RAM Heap
   display.setCursor(2, 25);
   display.printf("Free Heap: %u KB", ESP.getFreeHeap() / 1024);
 
-  // Min Free Heap
   display.setCursor(2, 36);
-  display.printf("Min Heap:  %u KB", ESP.getMinFreeHeap() / 1024);
+  display.printf("Sensors: DHT%s BMP%s",
+                 currentWeather.dhtValid ? "+" : "-",
+                 bmpFound ? "+" : "-");
 
-  // Flash Chip Size
   display.setCursor(2, 47);
   display.printf("Flash: %u MB", ESP.getFlashChipSize() / (1024 * 1024));
 
-  // BLE Connection State
   display.setCursor(2, 56);
   display.printf("BLE: %s", deviceConnected ? "Connected (Sygic)" : "Advertising");
 }
 
-// Mode 5: Torch / Screen Light
+// Mode 6: Torch / Screen Light
 void renderTorchMode() {
-  // Fill entire display white with maximum brightness
   display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
 }
 
@@ -524,7 +645,7 @@ void renderModeBanner() {
   display.print("SWITCHING TO:");
 
   display.setTextSize(1);
-  display.setCursor(14, 34);
+  display.setCursor(10, 34);
   display.print(modeNames[currentMode]);
 
   display.setCursor(20, 48);
@@ -588,7 +709,7 @@ class MyWriteCallbacks : public BLECharacteristicCallbacks {
 };
 
 // ============================================================
-// SETUP FUNCTIONS
+// INITIALIZATION FUNCTIONS
 // ============================================================
 
 void setupBLE() {
@@ -622,7 +743,7 @@ void setupBLE() {
   advertising->setMinPreferred(0x12);
 
   BLEDevice::startAdvertising();
-  Serial.println("BLE Advertising started successfully.");
+  Serial.println("BLE Advertising started.");
 }
 
 void setupOLED() {
@@ -636,15 +757,33 @@ void setupOLED() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(2);
-  display.setCursor(20, 10);
+  display.setCursor(20, 8);
   display.println("ESP32");
   display.setTextSize(1);
-  display.setCursor(12, 34);
-  display.println("Multi-Mode Device");
-  display.setCursor(18, 48);
-  display.println("Initializing...");
+  display.setCursor(14, 30);
+  display.println("Multi-Tool HUD");
+  display.setCursor(8, 46);
+  display.println("+ Weather Station");
   display.display();
   delay(1200);
+}
+
+void setupSensors() {
+  // Initialize DHT11
+  dht.begin();
+  Serial.println("DHT11 sensor initialized.");
+
+  // Initialize BMP180 on I2C bus
+  if (bmp.begin()) {
+    bmpFound = true;
+    Serial.println("BMP180 Barometer detected successfully.");
+  } else {
+    bmpFound = false;
+    Serial.println("BMP180 Barometer not detected (Check I2C wiring SDA=21, SCL=22).");
+  }
+
+  // Initial read
+  updateWeatherSensors();
 }
 
 // ============================================================
@@ -656,15 +795,15 @@ void setup() {
   delay(400);
 
   Serial.println("\n=========================================");
-  Serial.println(" ESP32 MULTIPURPOSE NAVIGATION & UTILITIES");
+  Serial.println(" ESP32 MULTIPURPOSE NAVIGATION & WEATHER");
   Serial.println("=========================================");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   setupOLED();
+  setupSensors();
   setupBLE();
 
-  // Trigger initial background WiFi scan for WiFi Scanner mode
   triggerWifiScan();
 
   lastActivity = millis();
@@ -680,37 +819,44 @@ const unsigned long DISPLAY_REFRESH_INTERVAL = 60; // ~16 FPS
 
 void loop() {
   // ----------------------------------------------------------
-  // 1. Handle Button Inputs (Short & Long Press)
+  // 1. Update Weather Sensors in Background
+  // ----------------------------------------------------------
+  updateWeatherSensors();
+
+  // ----------------------------------------------------------
+  // 2. Handle Button Inputs (Short & Long Press)
   // ----------------------------------------------------------
   ButtonEvent event = readButtonEvent();
 
   if (event == BTN_SHORT_PRESS) {
-    // Cycle to next mode
     currentMode = (AppMode)((currentMode + 1) % MODE_COUNT);
-    modeBannerUntil = millis() + 900; // Show mode name banner for 900ms
+    modeBannerUntil = millis() + 900;
     Serial.printf("[BUTTON] Short Press -> Switched to: %s\n", modeNames[currentMode]);
 
-    // Auto-trigger actions upon entering specific modes
     if (currentMode == MODE_WIFI_SCANNER && !isScanningWifi) {
       triggerWifiScan();
     }
   } else if (event == BTN_LONG_PRESS) {
     Serial.printf("[BUTTON] Long Press in mode: %s\n", modeNames[currentMode]);
 
-    // Contextual Long-press actions
     switch (currentMode) {
+      case MODE_WEATHER:
+        weatherUseImperial = !weatherUseImperial; // Toggle °C / m <-> °F / ft
+        Serial.printf("[WEATHER] Units toggled to: %s\n", weatherUseImperial ? "Imperial" : "Metric");
+        break;
+
       case MODE_STOPWATCH:
         if (stopwatchRunning) {
-          toggleStopwatch(); // Pause
+          toggleStopwatch();
         } else if (getStopwatchElapsed() > 0) {
-          resetStopwatch();  // Reset
+          resetStopwatch();
         } else {
-          toggleStopwatch(); // Start
+          toggleStopwatch();
         }
         break;
 
       case MODE_WIFI_SCANNER:
-        triggerWifiScan();   // Rescan WiFi
+        triggerWifiScan();
         break;
 
       default:
@@ -719,7 +865,7 @@ void loop() {
   }
 
   // ----------------------------------------------------------
-  // 2. Sygic BLE Keep-Alive Protocol (Background Task)
+  // 3. Sygic BLE Keep-Alive Protocol (Background Task)
   // ----------------------------------------------------------
   if (deviceConnected) {
     if (millis() - lastActivity > 4000) {
@@ -730,18 +876,21 @@ void loop() {
   }
 
   // ----------------------------------------------------------
-  // 3. Render Display
+  // 4. Render Display
   // ----------------------------------------------------------
   if (millis() - lastDisplayRefresh >= DISPLAY_REFRESH_INTERVAL) {
     lastDisplayRefresh = millis();
 
-    // Check if mode announcement banner is active
     if (millis() < modeBannerUntil) {
       renderModeBanner();
     } else {
       switch (currentMode) {
         case MODE_NAVIGATION:
           renderNavigationMode();
+          break;
+
+        case MODE_WEATHER:
+          renderWeatherMode();
           break;
 
         case MODE_STOPWATCH:

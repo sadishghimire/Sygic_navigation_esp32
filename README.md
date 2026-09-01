@@ -1,77 +1,84 @@
-# ESP32 Multipurpose Navigation HUD & Multi-Tool (0.96" OLED)
+# ESP32 Multipurpose HUD & Mini Weather Station (0.96" OLED)
 
-A versatile multi-tool firmware for **ESP32** featuring real-time **Sygic GPS Navigation BLE HUD**, digital stopwatch & clock, WiFi scanner & signal meter, system hardware monitor, and screen flashlight — easily switchable via a **tactile push button**.
+A versatile, multi-mode firmware for **ESP32** integrating **Sygic GPS Navigation BLE HUD**, an environmental **Mini Weather Station** (DHT11 & BMP180), digital stopwatch & clock, WiFi scanner, system hardware monitor, and screen flashlight — switchable via a **single tactile push button**.
 
 ---
 
 ## 📱 Available Modes
 
-You can switch between 5 distinct modes at any time using a single tactile switch:
+Cycle through 6 switchable modes using the tactile button:
 
-| Mode # | Mode Name | Description & Key Features | Button Actions |
+| Mode # | Mode Name | Description & Key Features | Button Controls |
 |---|---|---|---|
-| **1** | **Sygic Navigation HUD** | Full Sygic Smart HUD emulation: Real-time turn arrows (left, right, slight, sharp, keep, u-turn, straight), speed in km/h, distance & road names. *(BLE stays active in background across all modes)* | **Short Press**: Switch mode |
-| **2** | **Clock & Stopwatch** | Live uptime digital clock and high-precision stopwatch with tenths of a second. | **Short Press**: Switch mode<br>**Long Press**: Start / Pause / Reset |
-| **3** | **WiFi Scanner & RSSI** | Real-time 2.4 GHz WiFi discovery showing SSID list, RSSI signal strength in dBm, and total networks found. | **Short Press**: Switch mode<br>**Long Press**: Trigger immediate rescan |
-| **4** | **System Monitor** | Live ESP32 hardware diagnostics: CPU frequency (MHz), Free RAM heap, Min heap, Flash size, and BLE connection status. | **Short Press**: Switch mode |
-| **5** | **Screen Torch** | Turns the 0.96" OLED display into an all-white pocket flashlight. | **Short Press**: Switch mode |
+| **1** | **Sygic Navigation HUD** | Full Sygic Smart HUD emulation: Real-time turn arrows (left, right, slight, sharp, keep, u-turn, straight), speed in km/h, distance & road names. *(BLE stays active in background across all modes)* | **Short Press**: Next mode |
+| **2** | **🌤️ Mini Weather Station** | Live environmental monitoring: Ambient Temperature (°C/°F), Relative Humidity (% RH), Barometric Pressure (hPa), and Estimated Altitude (m/ft) with air comfort status. | **Short Press**: Next mode<br>**Long Press**: Toggle Metric (°C/m) & Imperial (°F/ft) |
+| **3** | **Clock & Stopwatch** | Live uptime digital clock and high-precision stopwatch with tenths of a second. | **Short Press**: Next mode<br>**Long Press**: Start / Pause / Reset |
+| **4** | **WiFi Scanner & RSSI** | Real-time 2.4 GHz WiFi discovery showing SSID list, RSSI signal strength in dBm, and total networks found. | **Short Press**: Next mode<br>**Long Press**: Trigger immediate rescan |
+| **5** | **System Monitor** | Live ESP32 diagnostics: CPU frequency (MHz), Free RAM heap, Sensor connectivity status (`DHT+ BMP+`), Flash size, and BLE status. | **Short Press**: Next mode |
+| **6** | **Screen Torch** | Turns the 0.96" OLED display into an all-white pocket flashlight. | **Short Press**: Next mode |
 
 ---
 
-## 🛠️ Hardware Requirements & Pinout
+## 🛠️ Hardware Wiring & Pinout
 
-### Required Components
-- **ESP32 Development Board** (NodeMCU-32S, ESP32-WROOM-32, etc.)
-- **0.96" I2C OLED Display** (SSD1306, 128x64 pixels, 0x3C I2C address)
-- **1x Tactile Push Button / Switch**
-- Jumper wires & breadboard
+### Components Needed
+1. **ESP32 Development Board** (NodeMCU-32S / ESP32-WROOM-32)
+2. **0.96" I2C OLED Display** (SSD1306, 128x64 pixels, address `0x3C`)
+3. **BMP180 Barometric Pressure & Altitude Sensor** (I2C)
+4. **DHT11 Temperature & Humidity Sensor** (1-Wire Digital)
+5. **1x Tactile Push Button / Switch**
+6. Jumper wires & breadboard
 
 ### Wiring Table
 
-| Component Pin | ESP32 GPIO Pin | Description / Notes |
-|---|---|---|
-| **OLED VCC** | 3.3V or 5V | Power supply |
-| **OLED GND** | GND | Ground |
-| **OLED SDA** | **GPIO 21** | I2C Data line |
-| **OLED SCL** | **GPIO 22** | I2C Clock line |
-| **Tactile Switch (Pin 1)** | **GPIO 18** | Input pin (uses internal `INPUT_PULLUP`) |
-| **Tactile Switch (Pin 2)** | **GND** | Ground (no external resistor required) |
-
-> [!TIP]
-> To use a different button GPIO, simply modify `#define BUTTON_PIN 18` near the top of [`Navigation_code.ino`](file:///e:/github/Sygic_navigation_esp32/Navigation_code.ino).
-
----
-
-## 🎮 How Button Controls Work
-
-- **Short Press (< 700 ms)**: Cycles sequentially to the next mode and presents an on-screen mode banner.
-- **Long Press (> 700 ms)**: Performs context-sensitive actions inside the current mode:
-  - **In Stopwatch Mode**: Starts timer &rarr; Pauses timer &rarr; Resets timer.
-  - **In WiFi Scanner Mode**: Starts an immediate new 2.4 GHz WiFi scan.
+| Component | Pin | ESP32 GPIO | Notes |
+|---|---|---|---|
+| **OLED Display** | VCC | 3.3V or 5V | Power |
+| | GND | GND | Ground |
+| | SDA | **GPIO 21** | I2C Data (Shared with BMP180) |
+| | SCL | **GPIO 22** | I2C Clock (Shared with BMP180) |
+| **BMP180 Sensor** | VCC | 3.3V | Power |
+| | GND | GND | Ground |
+| | SDA | **GPIO 21** | Connects to same I2C SDA as OLED |
+| | SCL | **GPIO 22** | Connects to same I2C SCL as OLED |
+| **DHT11 Sensor** | VCC | 3.3V or 5V | Power |
+| | GND | GND | Ground |
+| | DATA / OUT | **GPIO 4** | 1-Wire Digital Pin (Configurable `#define DHT_PIN 4`) |
+| **Tactile Button** | Pin 1 | **GPIO 18** | Input (uses internal `INPUT_PULLUP`) |
+| | Pin 2 | **GND** | Ground (no external resistor needed) |
 
 ---
 
 ## 📦 Required Arduino IDE Libraries
 
-Install these libraries via Arduino IDE (**Sketch > Include Library > Manage Libraries...**):
+Install the following libraries via the Arduino IDE Library Manager (**Sketch > Include Library > Manage Libraries...**):
+
 1. **Adafruit SSD1306** (by Adafruit)
 2. **Adafruit GFX Library** (by Adafruit)
-3. **ESP32 Board Package** (includes `BLEDevice.h` and `WiFi.h`)
+3. **Adafruit BMP085 Library** (by Adafruit — works with BMP180 & BMP085)
+4. **DHT sensor library** (by Adafruit)
+5. **Adafruit Unified Sensor** (dependency for DHT)
+6. **ESP32 Board Package** (includes `BLEDevice.h` and `WiFi.h`)
 
 ---
 
-## 🚀 How to Run & Connect Sygic
+## 🎮 Button Navigation
 
-1. Open [`Navigation_code.ino`](file:///e:/github/Sygic_navigation_esp32/Navigation_code.ino) in Arduino IDE.
-2. Select your ESP32 board and COM port.
-3. Click **Upload**.
-4. Open the Serial Monitor at `115200` baud.
-5. On your smartphone:
-   - Launch **Sygic GPS Navigation**.
-   - Start any navigation route.
-   - Go to Sygic Settings / Add-ons and enable **Head-up Display (HUD)** / Bluetooth HUD.
-   - The phone connects to **ESP32 HUD**, and navigation arrows, speed, and instructions will be shown on the OLED.
-   - You can press the tactile button anytime to check the stopwatch, scan WiFi, or check system memory without dropping the Sygic BLE connection!
+- **Short Press (< 700 ms)**: Cycles sequentially to the next mode and shows an on-screen mode banner.
+- **Long Press (> 700 ms)**:
+  - **In Weather Mode**: Toggles between Metric (°C, meters) and Imperial (°F, feet).
+  - **In Stopwatch Mode**: Starts &rarr; Pauses &rarr; Resets the stopwatch.
+  - **In WiFi Scanner Mode**: Triggers a new 2.4 GHz WiFi scan.
+
+---
+
+## 📲 Sygic BLE Navigation Connection
+
+1. Flash the sketch to your ESP32.
+2. Open **Sygic GPS Navigation** on your smartphone.
+3. Start a route and turn on **Head-up Display (HUD)** / Bluetooth HUD under Sygic's settings.
+4. The ESP32 connects automatically as **ESP32 HUD**.
+5. You can switch to Weather, Clock, or WiFi scanner modes anytime; navigation packets continue to be processed in the background!
 
 ---
 
